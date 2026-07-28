@@ -1,0 +1,193 @@
+ // ── COMET ENGINE ─────────────────────────────────────
+                    val cometColorParams = setOf(
+                        "Red", "Green", "Blue", "White", "Amber", "UV", "Dimmer",
+                        "Beam 1R", "Beam 1G", "Beam 1B", "Beam 1W", "Beam 1A",
+                        "Beam 2R", "Beam 2G", "Beam 2B", "Beam 2W", "Beam 2A",
+                        "Beam 3R", "Beam 3G", "Beam 3B", "Beam 3W", "Beam 3A",
+                        "Beam 4R", "Beam 4G", "Beam 4B", "Beam 4W", "Beam 4A"
+                    )
+                    Companion.fixturesList.forEach { fix ->
+                        val g = fix.groupIdx
+                        val activeSeqIdx = (0..3).firstOrNull { si -> seqEnabled[si] && seqGroupActive[si][g] }
+                        val currentFVal = if (activeSeqIdx != null) {
+                            val sq = memorySeq[activeSeqIdx]
+                            if (sq.stepFade[sq.currentStep] == -1) sq.globalFade else sq.stepFade[sq.currentStep]
+                        } else 0
+
+                        for (ch in 0 until fix.channels) {
+                            val param = fix.paramMap[ch]
+                            if (param !in cometColorParams) continue
+                            val actCh = fix.dmx - 1 + ch
+                            if (actCh !in 0..511) continue
+                            val targetVal = Companion.dmxValues[actCh].toFloat()
+
+                            // Floor: gdy SEQ zarządza kanałem = trzymaj targetVal,
+                            // gdy nie zarządza = zanikaj do tła (presetDmxValues)
+                            val floor = if (Companion.effectManagedChannels[actCh])
+                                targetVal
+                            else
+                                Companion.presetDmxValues[actCh].toFloat()
+
+                            when {
+                                currentFVal == 0 -> {
+                                    // Brak ogona – natychmiastowe przejście do floor
+                                    dmxPersist[actCh] = floor
+                                }
+                                currentFVal in 1..25 && dmxPersist[actCh] > floor -> {
+                                    val sq2 = if (activeSeqIdx != null) memorySeq[activeSeqIdx] else null
+                                    val stepDurC2 = if (sq2 != null) {
+                                        val rT = sq2.stepTime[sq2.currentStep]
+                                        when {
+                                            sq2.stepIsSync[sq2.currentStep] -> syncBeats.getOrElse(sq2.stepSyncIdx[sq2.currentStep]) { 1f } * (60f / masterBpm)
+                                            rT == -1f -> 99999f
+                                            rT > 0f -> rT
+                                            sq2.isSync -> syncBeats.getOrElse(sq2.syncIdx) { 1f } * (60f / masterBpm)
+                                            sq2.globalTime == -1f -> 99999f
+                                            else -> sq2.globalTime.coerceAtLeast(0.025f)
+                                        }
+                                    } else 0.5f
+                                    val tailTime = (stepDurC2 * currentFVal / 12.5f).coerceAtLeast(0.025f)
+                                    val fallSpeed = 255f / tailTime
+                                    dmxPersist[actCh] -= fallSpeed * dt.toFloat()
+                                    if (dmxPersist[actCh] < floor) dmxPersist[actCh] = floor
+                                }
+                                currentFVal > 25 && dmxPersist[actCh] > floor -> {
+                                    val sq = if (activeSeqIdx != null) memorySeq[activeSeqIdx] else null
+                                    val totalSteps = sq?.totalSteps?.coerceAtLeast(1) ?: 1
+                                    val stepDurC = if (sq != null) {
+                                        val rT = sq.stepTime[sq.currentStep]
+                                        when {
+                                            sq.stepIsSync[sq.currentStep] -> syncBeats.getOrElse(sq.stepSyncIdx[sq.currentStep]) { 1f } * (60f / masterBpm)
+                                            rT == -1f -> 99999f
+                                            rT > 0f -> rT
+                                            sq.isSync -> syncBeats.getOrElse(sq.syncIdx) { 1f } * (60f / masterBpm)
+                                            sq.globalTime == -1f -> 99999f
+                                            else -> sq.globalTime.coerceAtLeast(0.025f)
+                                        }
+                                    } else 0.5f
+                                    val cycleDur = (totalSteps * stepDurC).coerceAtLeast(0.025f)
+                                    val ratio = (currentFVal - 26) / 74f
+                                    val tailTime = cycleDur * (0.15f + ratio * 2.85f)
+                                    val fallSpeed = 255f / tailTime
+                                    dmxPersist[actCh] -= fallSpeed * dt.toFloat()
+                                    if (dmxPersist[actCh] < floor) dmxPersist[actCh] = floor
+                                }
+                                else -> {
+                                    // dmxPersist <= floor: ustaw na floor
+                                    dmxPersist[actCh] = floor
+                                }
+                            }
+
+                            val out = dmxPersist[actCh].toInt().coerceIn(0, 255)
+                            Companion.dmxValues[actCh] = out
+                            setDmxChannel(actCh, out)
+                        }
+                    }
+                    // ── KONIEC COMET ENGINE ───────────────────────────────
+                    // ── FX ENGINE ──────────────────────────────────────
+                    fun lfoMod(idx: Int): Float {
+                        if (idx < 0) return 0f
+                        val lfo = memoryLfo[idx]
+                        return computeWave(lfo.shapeIdx, Companion.lfoCurrentPhases[idx], 50)
+                    }
+
+                    // Inkrementuj timery fade FX raz na tick (poza pętlą fi – inaczej 4x za szybko)
+                    val dtF = dt.toFloat()
+                    for (fi in 0..3) {
+                        if (Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]) {
+                            Companion.fxFadeTimer[fi] = (Companion.fxFadeTimer[fi] + dtF).coerceAtMost(Companion.fxFadeTime[fi])
+                        }
+                        if (Companion.fxDisableDelay[fi] > 0f) {
+                            Companion.fxDisableDelay[fi] -= dtF
+                            if (Companion.fxDisableDelay[fi] <= 0f) {
+                                Companion.fxDisableDelay[fi] = 0f
+                                Companion.memoryFx[fi].isEnabled = false
+                                Companion.memoryFx[fi].amt = 0
+                            }
+                        }
+                    }
+                    for (fi in 0..3) {
+                        val fx = Companion.memoryFx[fi]
+
+                        // Ghost fix: zwolnij stare kanały gdy dest/group się zmieniły
+                        if (fx.prevDestIdx != fx.destIdx || fx.prevGroupIdx != fx.groupIdx) {
+                            if (fx.prevDestIdx != -1) {
+                                val oldParam = Companion.paramList.getOrNull(fx.prevDestIdx)
+                                Companion.fixturesList.filter { it.groupIdx == fx.prevGroupIdx }.forEach { fix ->
+                                    for (ch in 0 until fix.channels) if (fix.paramMap[ch] == oldParam) {
+                                        val actCh = fix.dmx - 1 + ch
+                                        if (actCh in 0..511) Companion.effectManagedChannels[actCh] = false
+                                    }
+                                }
+                            }
+                            fx.prevDestIdx  = fx.destIdx
+                            fx.prevGroupIdx = fx.groupIdx
+                        }
+
+                        val fxFadingOut = !fx.isEnabled && fx.destIdx != -1 &&
+                                Companion.fxFadeTime[fi] > 0f && Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]
+                        if (!fxFadingOut && (!fx.isEnabled || fx.destIdx == -1)) {
+                            val p = Companion.paramList.getOrNull(fx.destIdx) ?: continue
+                            Companion.fixturesList.filter { it.groupIdx == fx.groupIdx }.forEach { fix ->
+                                for (ch in 0 until fix.channels) if (fix.paramMap[ch] == p) {
+                                    val actCh = fix.dmx - 1 + ch
+                                    if (actCh in 0..511) Companion.effectManagedChannels[actCh] = false
+                                }
+                            }
+                            continue
+                        }
+
+                        val paramName = Companion.paramList.getOrNull(fx.destIdx) ?: continue
+                        val groupFixes = Companion.fixturesList.filter { it.groupIdx == fx.groupIdx }
+                        if (groupFixes.isEmpty()) continue
+
+                        // Parametry z modulacją LFO + fade AMT przy zmianie presetu
+
+                        val noteLengths = listOf(0f, 0.0625f, 0.125f, 0.25f, 0.5f, 4f/6f, 1f, 4f/3f, 2f, 4f, 8f, 12f, 16f)
+                        val effSpeed = if (fx.isSync) {
+                            val beatLen = noteLengths.getOrElse(fx.syncIdx) { 1f }
+                            if (beatLen <= 0f) 0f else (Companion.masterBpm / 60f) / beatLen
+                        } else fx.speed
+                        val effAmt = if (Companion.fxFadeTime[fi] > 0f && Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]) {
+                            val ratio = (Companion.fxFadeTimer[fi] / Companion.fxFadeTime[fi]).coerceIn(0f, 1f)
+                            (Companion.fxAmtStart[fi] + (fx.amt - Companion.fxAmtStart[fi]) * ratio).toInt()
+                        } else fx.amt
+                        val effPhs   = fx.phs.toFloat()
+
+                        // Przesuń fazę
+                        if (fx.playState != 0) {
+                            val dir = if (fx.playState == 2) -1f else 1f
+                            fx.phase += dir * effSpeed * dt.toFloat()
+                            while (fx.phase >= 1f) fx.phase -= 1f
+                            while (fx.phase < 0f)  fx.phase += 1f
+                        }
+
+                        val spread = fx.spread.coerceAtLeast(1).toFloat()
+                        val phsOff = effPhs / 360f
+
+                        groupFixes.forEachIndexed { idx, fix ->
+                            var fixPhase = fx.phase + idx / spread + phsOff
+                            while (fixPhase >= 1f) fixPhase -= 1f
+                            while (fixPhase < 0f)  fixPhase += 1f
+                            val waveVal      = computeWave(fx.shapeIdx, fixPhase, 50)
+                            val contribution = (waveVal * effAmt).toInt()
+                            for (ch in 0 until fix.channels) {
+                                if (fix.paramMap[ch] != paramName) continue
+                                val actCh = fix.dmx - 1 + ch
+                                if (actCh !in 0..511) continue
+                                // Podczas fade-out FX: base powinien być 0 (efekt gaśnie do zera),
+                                // nie wartość nowego presetu — inaczej contribution jest dodawane
+                                // na wierzch już zmienionego koloru.
+                                val base  = if (fxFadingOut) 0 else Companion.presetDmxValues[actCh]
+                                val lfoContribution = if (lfoTouched[actCh]) lfoAccum[actCh] else 0f
+                                val fxOut = (base + lfoContribution + contribution).toInt().coerceIn(0, 255)
+                                Companion.lfoOutputValues[actCh] = fxOut
+                                Companion.dmxValues[actCh] = fxOut
+                                // Podczas fade-out też trzymaj kanał – inaczej refreshDmxOutput
+                                // nadpisze go wartością nowego presetu zanim fade się skończy.
+                                Companion.effectManagedChannels[actCh] = true
+                                setDmxChannel(actCh, fxOut)
+                            }
+                        }
+                    }
+                    // ── KONIEC FX ENGINE ─────────────────────────────────
